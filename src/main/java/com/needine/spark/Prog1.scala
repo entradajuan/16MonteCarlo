@@ -168,7 +168,7 @@ object Prog1 {
     
     
     
-    println("AAA")
+    println("BBB")
     
   }
   
