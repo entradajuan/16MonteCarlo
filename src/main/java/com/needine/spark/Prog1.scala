@@ -2,10 +2,13 @@ package com.needine.spark
 
 import org.apache.spark._
 import org.apache.spark.SparkContext._
-
+import org.apache.spark.rdd.RDD
+  
+import org.apache.commons.math3.random.MersenneTwister
 import org.apache.commons.math3.stat.regression.OLSMultipleLinearRegression
 import org.apache.commons.math3.stat.correlation.Covariance
 import org.apache.commons.math3.distribution.MultivariateNormalDistribution
+import org.apache.commons.math3.stat.correlation.PearsonsCorrelation
 
 import java.text.SimpleDateFormat
 import java.io.File
@@ -17,6 +20,7 @@ import scala.collection.mutable.ArrayBuffer
 import com.github.nscala_time.time.Imports._
 
 import breeze.plot._
+import org.apache.spark.mllib.stat.correlation.PearsonCorrelation
 
 object Prog1 {
   
@@ -117,15 +121,65 @@ object Prog1 {
     p.ylabel = "Density"
   }
  
+  def instrumentTrialReturn(instrument: Array[Double], trial: Array[Double]):Double = {
+    var instrumentTrialReturn = instrument(0)
+    var i = 0
+    while(i < trial.length){
+      instrumentTrialReturn += trial(i) * instrument(i+1)
+      i += 1
+    }
+    instrumentTrialReturn  
+  }
   
-  // MAIN ---------------------------------
+  def trialReturn(trial : Array[Double], instruments:Seq[Array[Double]]):Double = {
+    var totalReturn = 0.0
+    for(instr <- instruments){
+      totalReturn += instrumentTrialReturn(instr, trial)
+    }
+    totalReturn/instruments.size
+  }
   
+  def trialReturns(seed: Long, numTrials: Int, instruments: Seq[Array[Double]], factorMeans: Array[Double], factorCovariances: Array[Array[Double]]): Seq[Double] = {
+    val rand = new MersenneTwister(seed)
+    val multivariateNormal = new MultivariateNormalDistribution(rand, factorMeans, factorCovariances)
+    
+    val trialReturns = new Array[Double](numTrials)
+    
+    for( i<- 0 until numTrials){
+      val trialFactorReturns = multivariateNormal.sample
+      val trialFeatures = featurize(trialFactorReturns)
+      trialReturns(i) = trialReturn(trialFeatures, instruments)
+    }
+    trialReturns
+  }
+  
+  def fivePercentVaR(trials: RDD[Double]): Double = {
+    val topLosses = trials.takeOrdered(math.max(trials.count().toInt/20, 1))
+    topLosses.last
+    
+  }
+  
+  def plotDistribution(samples: RDD[Double]){
+    val stats = samples.stats()
+    val min = stats.min
+    val max = stats.max
+    val domain = Range.Double(min, max, (max-min)/100).toList.toArray
+    val densities = KernelDensity.estimate(samples, domain)
+    val f = Figure()
+    val p = f.subplot(0)
+    p += plot(domain, densities)
+    p.xlabel = "Two Weeks Return ($)"
+    p.ylabel = "Density"
+  }
+  
+  
+  // MAIN ---------------------------------  
   def main(args: Array[String]) = {
     
     val appName = "Monte Carlo 1.6"
     val conf    = new SparkConf()
 
-    conf.setAppName(appName).setMaster("local[*]").setExecutorEnv("driver-memory", "8G")
+    conf.setAppName(appName).setMaster("local[*]").setExecutorEnv("driver-memory", "12G")
     val sc = new SparkContext(conf)
     
     // Primera tarea
@@ -133,26 +187,10 @@ object Prog1 {
     val start = new DateTime(2009, 10, 27, 0, 0)
     val end = new DateTime(2016, 10, 27, 0, 0)
     
-    
     val factorsPrefix = "C:/Users/juani/Documents/ml/MonteCarlo/factors/"
     
-    /*
-    val rawRDD1 = sc.textFile(factorsPrefix+"CrudeOil.data")
-    rawRDD1.take(10).foreach { println }
-    val rawRDD2 = sc.textFile(factorsPrefix+"TreasuryBonds.data")
-    rawRDD2.take(10).foreach { println }
-
-    val format = new SimpleDateFormat("MMM d, yyyy")
-    println(format.parse("Jan 31, 2017"))
-    */
-    
-    
-    
     val factors1: Seq[Array[(DateTime, Double)]] = Array("CrudeOil.data", "TreasuryBonds.data").map { f => new File(factorsPrefix+f) }.map(readInvestingHistory(_))     
-    
-    
     val factors2: Seq[Array[(DateTime, Double)]] = Array("GSPC.csv", "IXIC.csv").map { f => new File(factorsPrefix+f) }.map(readInvestingHistory(_))     
-    
     
     val files = new File("C:/Users/juani/Documents/ml/MonteCarlo/stocks/").listFiles()
     val rawStocks:Seq[Array[(DateTime, Double)]] = files.flatMap { file =>  
@@ -162,7 +200,6 @@ object Prog1 {
         case e : Exception => None
       }
     }.filter(_.size >= 260*5+10)
-
     
     val stocks = rawStocks.map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))  
     val factors = (factors1 ++ factors2).map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))
@@ -176,22 +213,34 @@ object Prog1 {
     val factorFeatures = factorMat.map { featurize(_) }
     val models = stocksReturns.map(linearModel(_, factorFeatures))
     val factorWeights = models.map(_.estimateRegressionParameters()).toArray
-    
+       
     // Segunda tarea
     plotDistribution(factorsReturns(0))
     plotDistribution(factorsReturns(1))
     
+    //val factorCor = new PearsonCorrelation(factorMat).getCorrelationMatrix().getData()
+    //println()
+    
     val factorCov = new  Covariance(factorMat).getCovarianceMatrix.getData
-    val factorMeans = stocksReturns.map(factor => factor.sum/factor.size).toArray
+    val factorMeans = factorsReturns.map(factor => factor.sum/factor.size).toArray
     val factorsDist = new MultivariateNormalDistribution(factorMeans, factorCov)
-    //println(factorsDist.sample().toString())
-    
-    
     
     
     // Tercera tarea
+    val parallelism = 48
+    val baseSeed = 1496
+    val seeds = (baseSeed until baseSeed + parallelism)
+    val seedRDD = sc.parallelize(seeds, parallelism)
     
     
+    val numTrials = 10000000
+    val bFactorWeights = sc.broadcast(factorWeights)
+    
+    val trials = seedRDD.flatMap (trialReturns(_, numTrials/parallelism, bFactorWeights.value, factorMeans, factorCov))
+    val valueAtRisk = fivePercentVaR(trials)
+    
+    println(valueAtRisk)
+    plotDistribution(trials)
     
     println("AAA")
     
