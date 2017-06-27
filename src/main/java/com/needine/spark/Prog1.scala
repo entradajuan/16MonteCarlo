@@ -117,7 +117,7 @@ object Prog1 {
     val f = Figure()
     val p = f.subplot(0)
     p += plot(domain, densities)
-    p.xlabel = "Two week return ($)"
+    p.xlabel = "Two week return (% variation)"
     p.ylabel = "Density"
   }
  
@@ -159,7 +159,7 @@ object Prog1 {
     
   }
   
-  def plotDistribution(samples: RDD[Double]){
+  def plotDistribution2(samples: RDD[Double]){
     val stats = samples.stats()
     val min = stats.min
     val max = stats.max
@@ -168,10 +168,28 @@ object Prog1 {
     val f = Figure()
     val p = f.subplot(0)
     p += plot(domain, densities)
-    p.xlabel = "Two Weeks Return ($)"
+    p.xlabel = "Two Weeks Return (% variation)"
     p.ylabel = "Density"
   }
-  
+
+  def bootstrappedConfidenceInterval(
+      trials: RDD[Double], 
+      computeStatistics: RDD[Double]=>Double, 
+      numResamples: Int, 
+      pValue: Double ):(Double, Double) ={
+    
+    val stats = (0 until numResamples).map{ i =>
+      val resample = trials.sample(true, 1.0)
+      computeStatistics(resample)
+    }.sorted
+    
+    val lowerIndex = (numResamples*pValue/2).toInt
+    val upperIndex = (numResamples*(1-pValue/2)).toInt
+    
+    (stats(lowerIndex), stats(upperIndex))
+    
+  }
+
   
   // MAIN ---------------------------------  
   def main(args: Array[String]) = {
@@ -184,15 +202,18 @@ object Prog1 {
     
     // Primera tarea
     
-    val start = new DateTime(2009, 10, 27, 0, 0)
-    val end = new DateTime(2016, 10, 27, 0, 0)
+    val start = new DateTime(2013, 10, 27, 0, 0)
+    val end = new DateTime(2017, 2, 27, 0, 0)
     
+    //val factorsPrefix = "C:/Users/juani/Documents/ml/MonteCarlo/factors2/"
     val factorsPrefix = "C:/Users/juani/Documents/ml/MonteCarlo/factors/"
     
     val factors1: Seq[Array[(DateTime, Double)]] = Array("CrudeOil.data", "TreasuryBonds.data").map { f => new File(factorsPrefix+f) }.map(readInvestingHistory(_))     
     val factors2: Seq[Array[(DateTime, Double)]] = Array("GSPC.csv", "IXIC.csv").map { f => new File(factorsPrefix+f) }.map(readInvestingHistory(_))     
+    //val factors2: Seq[Array[(DateTime, Double)]] = Array("GSPC.csv").map { f => new File(factorsPrefix+f) }.map(readInvestingHistory(_))     
+
     
-    val files = new File("C:/Users/juani/Documents/ml/MonteCarlo/stocks/").listFiles()
+    val files = new File("C:/Users/juani/Documents/ml/MonteCarlo/portfolioGoogle/").listFiles()
     val rawStocks:Seq[Array[(DateTime, Double)]] = files.flatMap { file =>  
       try{
         Some(readYahoo(file))
@@ -203,6 +224,7 @@ object Prog1 {
     
     val stocks = rawStocks.map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))  
     val factors = (factors1 ++ factors2).map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))
+    //val factors = ( factors2).map(trimToRegion(_, start, end)).map(fillInHistory(_, start, end))
     
     println((stocks ++ factors).forall(_.size == stocks(0).size))
     
@@ -216,22 +238,24 @@ object Prog1 {
        
     // Segunda tarea
     plotDistribution(factorsReturns(0))
-    plotDistribution(factorsReturns(1))
+    //plotDistribution(factorsReturns(1))
+    plotDistribution(stocksReturns(0))
+    
     
     //val factorCor = new PearsonCorrelation(factorMat).getCorrelationMatrix().getData()
     //println()
     
+    
+    // Covariance Study
     val factorCov = new  Covariance(factorMat).getCovarianceMatrix.getData
     val factorMeans = factorsReturns.map(factor => factor.sum/factor.size).toArray
     val factorsDist = new MultivariateNormalDistribution(factorMeans, factorCov)
-    
     
     // Tercera tarea
     val parallelism = 48
     val baseSeed = 1496
     val seeds = (baseSeed until baseSeed + parallelism)
     val seedRDD = sc.parallelize(seeds, parallelism)
-    
     
     val numTrials = 10000000
     val bFactorWeights = sc.broadcast(factorWeights)
@@ -240,7 +264,62 @@ object Prog1 {
     val valueAtRisk = fivePercentVaR(trials)
     
     println(valueAtRisk)
-    plotDistribution(trials)
+    plotDistribution2(trials)
+    
+    //----------------------------------------------------------------------------------------------------------------------
+    //Bootstrapped confidence interval
+    //val confidenceInterval = bootstrappedConfidenceInterval(trials, fivePercentVaR, 50, 0.05)
+    //println(confidenceInterval._1 + " to " + confidenceInterval._2)
+    
+    //----------------------------------------------------------------------------------------------------------------------
+    //Kupiec's Proprotion of failures (POF)
+    var failures = 0
+    for (i <- 0 until stocksReturns(0).size) {
+      val loss = stocksReturns.map { x => x(i) }.sum / stocksReturns.size
+      if (loss < valueAtRisk){
+        failures += 1
+      }
+    }
+
+    
+    val total = stocksReturns(0).size
+    val confidenceLevel = 0.05
+    val failureRatio = failures.toDouble / total
+    val logNumber = (total-failures) * math.log1p(-confidenceLevel) + failures * math.log(confidenceLevel)
+    val logDenon = (total-failures) * math.log1p(-failureRatio) + failures * math.log(failureRatio)
+    val testStatistic = -2 * (logNumber-logDenon)
+
+    println("TESTING")
+    println("valueAtRisk = " + valueAtRisk)
+    println("Failures : " + failures)
+    println("totalWeeks = " + total)
+    println("failureRatio = " + failureRatio)
+    //println("logNumber = " + logNumber)
+    //println("logDenon = " + logDenon)
+    //println("math.log1p(-failureRatio) = " + math.log1p(-failureRatio))
+    //println("math.log(failureRatio) = " + math.log(failureRatio))
+    
+    println("testStatistic = " + testStatistic)
+    
+    import org.apache.commons.math3.distribution.ChiSquaredDistribution
+    
+    println("p-Value = " + (1-new ChiSquaredDistribution(1.0).cumulativeProbability(testStatistic)))
+    
+    /*
+    println("stocksReturns")
+    for(i <- 0 until 20) {
+      println(stocksReturns(0)(i))
+    }
+    
+    println("Trials")
+    trials.take(20).foreach { println }
+    */
+    println("factorWeights")
+    factorWeights.foreach{a => 
+      (0 until a.size).map{i =>
+        println(a(i) ) 
+      }
+    }
     
     println("AAA")
     
